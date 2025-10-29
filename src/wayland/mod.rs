@@ -231,13 +231,24 @@ impl Session {
 
 impl WaylandHelper {
     pub fn new(conn: wayland_client::Connection) -> Self {
-        // XXX unwrap
-        let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+        // Initialize registry and globals
+        let (globals, mut event_queue) = registry_queue_init(&conn)
+            .expect("Failed to initialize registry");
+
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
         let screencopy_state = ScreencopyState::new(&globals, &qh);
-        let shm_state = Shm::bind(&globals, &qh).unwrap();
-        let zwp_dmabuf = globals.bind(&qh, 4..=4, sctk::globals::GlobalData).unwrap();
+        let shm_state = Shm::bind(&globals, &qh).expect("Failed to bind SHM");
+
+        // Try to bind DMABUF safely
+        let zwp_dmabuf = globals.list().iter()
+            .find(|g| g.interface == "zwp_linux_dmabuf_v1")
+            .map(|global| {
+                let version = global.version.min(4);
+                globals.bind(&qh, version..=version, sctk::globals::GlobalData)
+                    .expect("Failed to bind DMABUF global")
+            });
+
         let wayland_helper = WaylandHelper {
             inner: Arc::new(WaylandHelperInner {
                 conn,
@@ -248,28 +259,30 @@ impl WaylandHelper {
                 qh: qh.clone(),
                 capturer: screencopy_state.capturer().clone(),
                 wl_shm: shm_state.wl_shm().clone(),
-                dmabuf: Mutex::new(None),
+                dmabuf: Mutex::new(None),  // can store optional DmabufHelper later
                 zwp_dmabuf,
             }),
         };
+
         let dmabuf_state = DmabufState::new(&globals, &qh);
         let _ = dmabuf_state.get_default_feedback(&qh);
+
         let mut data = AppData {
-            // XXX must be before workspace and toplevel_info
             output_state: OutputState::new(&globals, &qh),
             shm_state,
             wayland_helper: wayland_helper.clone(),
             screencopy_state,
             dmabuf_state,
-            // XXX must be before toplevel_info
             workspace_state: WorkspaceState::new(&registry_state, &qh),
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
             registry_state,
         };
-        event_queue.flush().unwrap();
 
+        // Flush & roundtrip to ensure globals are received
+        event_queue.flush().unwrap();
         event_queue.roundtrip(&mut data).unwrap();
 
+        // Spawn the event loop
         thread::spawn(move || {
             loop {
                 event_queue.blocking_dispatch(&mut data).unwrap();
@@ -278,220 +291,6 @@ impl WaylandHelper {
 
         wayland_helper
     }
-
-    pub fn dmabuf(&self) -> Option<DmabufHelper> {
-        self.inner.dmabuf.lock().unwrap().clone()
-    }
-
-    pub fn outputs(&self) -> Vec<wl_output::WlOutput> {
-        // TODO Good way to avoid allocation?
-        self.inner.outputs.lock().unwrap().clone()
-    }
-
-    pub fn toplevels(&self) -> Vec<ToplevelInfo> {
-        self.inner.toplevels.lock().unwrap().clone()
-    }
-
-    pub fn output_info(&self, output: &wl_output::WlOutput) -> Option<OutputInfo> {
-        self.inner.output_infos.lock().unwrap().get(output).cloned()
-    }
-
-    pub fn output_for_name(&self, name: &str) -> Option<wl_output::WlOutput> {
-        self.inner
-            .output_infos
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, v)| v.name.as_deref() == Some(name))
-            .map(|(output, _)| output.clone())
-    }
-
-    fn set_output_info(&self, output: &wl_output::WlOutput, output_info_opt: Option<OutputInfo>) {
-        let mut output_infos = self.inner.output_infos.lock().unwrap();
-        match output_info_opt {
-            Some(output_info) => {
-                output_infos.insert(output.clone(), output_info);
-            }
-            None => {
-                output_infos.remove(output);
-            }
-        }
-    }
-
-    pub fn capture_output_toplevels_shm<'a>(
-        &'a self,
-        output: &wl_output::WlOutput,
-        overlay_cursor: bool,
-    ) -> impl Stream<Item = ShmImage<OwnedFd>> + 'a {
-        // get the active workspace for this output
-        // get the toplevels for that workspace
-        // capture each toplevel
-
-        let toplevels = self
-            .inner
-            .output_toplevels
-            .lock()
-            .unwrap()
-            .get(output)
-            .cloned()
-            .unwrap_or_default();
-
-        toplevels
-            .into_iter()
-            .map(|foreign_toplevel| {
-                let source = CaptureSource::Toplevel(foreign_toplevel.clone());
-                self.capture_source_shm(source, overlay_cursor)
-            })
-            .collect::<FuturesOrdered<_>>()
-            .filter_map(|x| async { x })
-    }
-
-    pub fn capture_source_session(&self, source: CaptureSource, overlay_cursor: bool) -> Session {
-        Session(Arc::new_cyclic(|weak_session| {
-            let options = if overlay_cursor {
-                CaptureOptions::PaintCursors
-            } else {
-                CaptureOptions::empty()
-            };
-            // Unwrap: cosmic-comp should always support this capture
-            let capture_session = self
-                .inner
-                .capturer
-                .create_session(
-                    &source,
-                    options,
-                    &self.inner.qh,
-                    SessionData {
-                        session: weak_session.clone(),
-                        session_data: Default::default(),
-                    },
-                )
-                .unwrap();
-
-            self.inner.conn.flush().unwrap();
-
-            SessionInner {
-                wayland_helper: self.clone(),
-                capture_session,
-                condvar: Condvar::new(),
-                state: Default::default(),
-            }
-        }))
-    }
-
-    pub async fn capture_source_shm(
-        &self,
-        source: CaptureSource,
-        overlay_cursor: bool,
-    ) -> Option<ShmImage<OwnedFd>> {
-        // XXX error type?
-        // TODO: way to get cursor metadata?
-
-        let session = self.capture_source_session(source, overlay_cursor);
-
-        // TODO: Check that format has been advertised in `Formats`
-        let (width, height) = session
-            .wait_for_formats(|formats| formats.buffer_size)
-            .await?;
-
-        let fd = buffer::create_memfd(width, height);
-        let buffer =
-            self.create_shm_buffer(&fd, width, height, width * 4, wl_shm::Format::Abgr8888);
-
-        let damage = &[Rect {
-            x: 0,
-            y: 0,
-            width: width as i32,
-            height: height as i32,
-        }];
-        let res = session.capture_wl_buffer(&buffer, damage).await;
-        buffer.destroy();
-
-        if let Ok(frame) = res {
-            let transform = match frame.transform {
-                WEnum::Value(value) => value,
-                WEnum::Unknown(value) => panic!("invalid capture transform: {}", value),
-            };
-            Some(ShmImage {
-                fd,
-                width,
-                height,
-                transform,
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn create_shm_buffer<Fd: AsFd>(
-        &self,
-        fd: &Fd,
-        width: u32,
-        height: u32,
-        stride: u32,
-        format: wl_shm::Format,
-    ) -> wl_buffer::WlBuffer {
-        let pool = self.inner.wl_shm.create_pool(
-            fd.as_fd(),
-            stride as i32 * height as i32,
-            &self.inner.qh,
-            (),
-        );
-        let buffer = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            stride as i32,
-            format,
-            &self.inner.qh,
-            (),
-        );
-
-        pool.destroy();
-
-        buffer
-    }
-
-    pub fn create_dmabuf_buffer<Fd: AsFd>(
-        &self,
-        dmabuf: &buffer::Dmabuf<Fd>,
-    ) -> wl_buffer::WlBuffer {
-        // TODO ensure dmabuf is valid format with right number of planes?
-        // - params.add can raise protocol error
-        let params = self
-            .inner
-            .zwp_dmabuf
-            .create_params(&self.inner.qh, sctk::globals::GlobalData);
-        let modifier = u64::from(dmabuf.modifier);
-        let modifier_hi = (modifier >> 32) as u32;
-        let modifier_lo = (modifier & 0xffffffff) as u32;
-        for (i, plane) in dmabuf.planes.iter().enumerate() {
-            params.add(
-                plane.fd.as_fd(),
-                i as u32,
-                plane.offset,
-                plane.stride,
-                modifier_hi,
-                modifier_lo,
-            );
-        }
-        // XXX use create
-        params.create_immed(
-            dmabuf.width as i32,
-            dmabuf.height as i32,
-            dmabuf.format as u32,
-            zwp_linux_buffer_params_v1::Flags::empty(),
-            &self.inner.qh,
-            (),
-        )
-    }
-}
-
-pub struct ShmImage<T: AsFd> {
-    fd: T,
-    pub width: u32,
-    pub height: u32,
-    pub transform: wl_output::Transform,
 }
 
 impl<T: AsFd> ShmImage<T> {
